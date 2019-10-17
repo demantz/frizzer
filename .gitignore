@@ -1,0 +1,12 @@
+# compiled python
+*.pyc
+
+# pip
+*.egg-info
+
+# virtualenv
+venv
+
+# ctags
+tags
+
