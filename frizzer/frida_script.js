@@ -1,9 +1,13 @@
 "use strict"
-function debug(msg)   { /*console.log("[+] " + msg)*/ }
-function debugCov(msg){ /*console.log("[+] " + msg)*/ }
+var debugging_enabled = false
+function debug(msg)   { if(debugging_enabled){console.log("[+ ("+Process.id+")] " + msg)} }
+function debugCov(msg){ if(debugging_enabled){console.log("[+ ("+Process.id+")] " + msg)} }
 function warning(msg) { console.warn("[!] " + msg) }
 
 debug("loading script...")
+
+var stalker_attached = false;
+var stalker_finished = false;
 
 var whitelist = ['all'];
 
@@ -39,7 +43,7 @@ var filtered_maps = new ModuleMap(function (m) {
 
 // Always trust code. #Make it faster
 Stalker.trustThreshold = 0;
-var stalker_events = undefined
+var stalker_events = []
 
 var target_function = undefined
 
@@ -60,6 +64,11 @@ rpc.exports = {
         return Process.id;
     },
 
+    // get the absolute address of a function by name
+    resolvesymbol: function(symbolname) {
+        return DebugSymbol.fromName(symbolname).address;
+    },
+
     // initialize the address of the target function (to-be-hooked)
     // and attach the Interceptor
     settarget: function(target) {
@@ -71,11 +80,12 @@ rpc.exports = {
                 //debug('Called ------func-------: ');
                 //debug("Stalker.queueCapacity=" + Stalker.queueCapacity)
                 //debug("Stalker.queueDrainInterval=" + Stalker.queueDrainInterval)
+                stalker_attached = true
+                stalker_finished = false
                 Stalker.queueCapacity = 100000000
                 Stalker.queueDrainInterval = 1000*1000
 
                 debugCov("follow")
-                stalker_events = undefined
                 Stalker.follow(Process.getCurrentThreadId(), {
                     events: {
                         call: false,
@@ -85,13 +95,8 @@ rpc.exports = {
                         compile: true
                     },
                     onReceive: function (events) {
-                        debugCov("onReceive")
-                        var bbs = Stalker.parse(events,
-                            {stringify: false, annotate: false});
-                        if(stalker_events != undefined) {
-                            warning("onReceive: Got another stalker event!")
-                        }
-                        stalker_events = bbs
+                        debugCov("onReceive: len(stalker_events)=" + stalker_events.length)
+                        stalker_events.push(events)
                     }
                     /*onCallSummary: function (summary) {
                         console.log("onCallSummary: " + JSON.stringify(summary))
@@ -108,6 +113,7 @@ rpc.exports = {
                     Stalker.garbageCollect();
                 }
                 gc_cnt++;
+                stalker_finished = true
                 //send("finished")
             }
         });
@@ -201,10 +207,31 @@ rpc.exports = {
         return stalker_events
     },
 
+    // check stalker state
+    checkstalker: function(args) {
+        debugCov("checkstalker: len(stalker_events)=" + stalker_events.length + 
+                    "  stalker_{attached,finished}=" + stalker_attached + "," + stalker_finished)
+        return [stalker_attached, stalker_finished];
+    },
     // get the coverage
     getcoverage: function(args) {
-        debugCov("getcoverage")
-        return stalker_events
+        debugCov("getcoverage: len(stalker_events)=" + stalker_events.length)
+        if(stalker_events.length == 0)
+            return undefined;
+        var accumulated_events = []
+        for(var i = 0; i < stalker_events.length; i++) {
+            var parsed = Stalker.parse(stalker_events[i], {stringify: false, annotate: false})
+            accumulated_events = accumulated_events.concat(parsed);
+        }
+        //debugCov("cov: " + accumulated_events)
+        return accumulated_events;
+    },
+    // clear the coverage (set empty)
+    clearcoverage: function(args) {
+        debugCov("clearcoverage")
+        stalker_events = []
+        stalker_attached = false
+        stalker_finished = false
     }
 };
 debug("Loading JS complete")

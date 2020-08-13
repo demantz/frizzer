@@ -6,6 +6,7 @@
 #         Birk Kauer   (ERNW GmbH)
 
 from subprocess import check_output
+import traceback
 import argparse
 import frida
 import socket
@@ -31,115 +32,101 @@ class FridaFuzzer:
     """
 
     def __init__(self, project):
-        self.project       = project
-        self.corpus        = None
-        self.frida_session = None
-        self.frida_script  = None
-        self.modules       = None
-        self.watched_modules = None
-        self.accumulated_coverage = set()
-        self.total_executions = 0
-        self.start_time = None
+        self.project                 = project
+        self.targets                 = project.targets
+        self.active_target           = project.targets[0]   # Target which produced coverage most recently
+        self.corpus                  = None
+        self.accumulated_coverage    = set()
+        self.total_executions        = 0
+        self.start_time              = None
+        self.payload_filter_function = None
 
         if not os.path.exists(project.coverage_dir):
             os.mkdir(project.coverage_dir)
 
-    def getModuleMap(self):
-        if self.frida_script == None:
-            log.warn("getModuleMap: self.frida_script is None!")
-            return None
-
-        try:
-            modulemap = self.frida_script.exports.makemaps()
-        except frida.core.RPCException as e:
-            log.info("RPCException: " + repr(e))
-            return None
-
-        self.modules = []
-        for image in modulemap:
-            idx  = image['id']
-            path = image['path']
-            base = int(image['base'], 0)
-            end  = int(image['end'], 0)
-            size = image['size']
-
-            m = {
-                    'id'    : idx,
-                    'path'  : path,
-                    'base'  : base,
-                    'end'   : end,
-                    'range' : range(base, end),
-                    'size'  : size}
-
-            self.modules.append(m)
-        return self.modules
-
-    def createModuleFilterList(self):
-        """
-        Creates the list of modules in which coverage information
-        should be collected. This list is created by querying frida
-        for the loaded modules and comparing them to the modules
-        the user selected in the project settings.
-
-        Must be called after frida was attached to the target and
-        before any coverage is collected.
-        """
-
-        if self.modules == None:
-            log.warn("filterModules: self.modules is None!")
-            return False
-
-        self.watched_modules = []
-        for module in self.modules:
-            if module["path"] in self.project.modules:
-                self.watched_modules.append(module)
-
-        if len(self.watched_modules) == 0:
-            paths = "\n".join([m["path"] for m in self.modules])
-            log.warn("filterModules: No module was selected! Possible choices:\n" + paths)
-            return False
-        else:
-            paths = "\n".join([m["path"] for m in self.watched_modules])
-            log.info("Filter coverage to only include the following modules:\n" + paths)
+    def loadPayloadFilter(self):
+        if self.project.payload_filter == None:
             return True
+        if not os.path.exists(self.project.payload_filter):
+            log.warn("Payload filter (file: '%s') does not exist!" % self.project.payload_filter)
+            return False
+        saved_sys_path = sys.path
+        try:
+            payload_filter_file_without_ext = os.path.splitext(self.project.payload_filter)[0]
+            payload_filter_module_path = os.path.dirname(payload_filter_file_without_ext)
+            payload_filter_module_name = os.path.basename(payload_filter_file_without_ext)
+            sys.path.insert(0, payload_filter_module_path)
+            payload_filter_module = __import__(payload_filter_module_name)
+            self.payload_filter_function = payload_filter_module.payload_filter_function
+            sys.path = saved_sys_path
+        except Exception as e:
+            sys.path = saved_sys_path
+            log.warn("loadPayloadFilter: " + str(e))
+            log.debug("Full Stack Trace:\n" + traceback.format_exc())
+            return False
 
+        sys.path = saved_sys_path
+        return True
 
-    def loadScript(self):
-        scriptfile = os.path.join(os.path.dirname(__file__),'frida_script.js')
-        log.info("Loading script: %s" % scriptfile)
-        script_code = open(scriptfile, "r").read()
-        script = self.frida_session.create_script(script_code)
+    def runPayloadFilterFunction(self, fuzz_pkt):
+        """
+        Returns a filtered version of the fuzz payload (as bytes object)
+        or None if the payload should not be used by the fuzzer.
+        The payload is first passed through the user-provided payload
+        filter (if specified). The filter may modify the payload before
+        returning or decide to not return any payload (None) in which
+        case the fuzzer should skip the payload.
+        """
+        if self.payload_filter_function != None:
+            try:
+                fuzz_pkt = self.payload_filter_function(fuzz_pkt)
+            except Exception as e:
+                log.warn("The payload filter '%s' caused an exception: %s" % (self.project.payload_filter, str(e)))
+                log.debug("Full Stack Trace:\n" + traceback.format_exc())
+            if not isinstance(fuzz_pkt, bytes) and fuzz_pkt != None:
+                log.warn("The payload filter '%s' returned unsupported type: '%s'."
+                            % (self.project.payload_filter, str(type(fuzz_pkt))))
+                return None
 
-        def on_message(message, data):
-            if 'payload' in message.keys() and str(message['payload']) == "finished":
-                pass
-            else:
-                log.info("on_message: " + str(message))
-            #log.info("on_message: " + str(message['payload']))
-            #log.info("on_message (data): " + str(data))
+        return fuzz_pkt
 
-        script.on('message', on_message)
-        script.load()
-        script.exports.settarget(self.project.target_function)
-        self.frida_script = script
-        return script
+    def getMutatedPayload(self, pkt_file, seed):
+        """
+        Returns a mutated version of the content inside pkt_file (as bytes object)
+        or None if the payload should not be used by the fuzzer.
+        """
+
+        fuzz_pkt = check_output(["radamsa", "-s", str(seed), pkt_file])
+        if self.project.max_payload_size > 0 and len(fuzz_pkt) > self.project.max_payload_size:
+            fuzz_pkt = fuzz_pkt[:self.project.max_payload_size]
+
+        return fuzz_pkt
+
 
     def sendFuzzPayload(self, payload):
         """
         Send fuzzing payload to target process via TCP socket
         """
 
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-        if self.project.ssl:
-            s = ssl.wrap_socket(s)
-        s.connect((self.project.host, self.project.port))
-
+        dest = (self.project.host, self.project.port)
         try:
-            s.sendall(payload)
-            if self.project.recv_timeout:
-                s.settimeout(self.project.recv_timeout)
-                s.recv(1)
+            if not self.project.udp:
+                # TCP
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect(dest)
+                if self.project.ssl:
+                    s = ssl.wrap_socket(s)
+
+                s.sendall(payload)
+                if self.project.recv_timeout:
+                    s.settimeout(self.project.recv_timeout)
+                    s.recv(1)
+
+            else:
+                # UDP (only send single UDP packets)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.sendto(payload, dest)
+
         except IOError as e:
             #log.debug("IOError: " + str(e))
             pass
@@ -150,64 +137,119 @@ class FridaFuzzer:
 
     def sendFuzzPayloadInProcess(self, payload):
         """
-        Send fuzzing payload to target process by invoking the target function
+        Send fuzzing payload to target[0] process by invoking the target function
         directly in frida
         """
 
         # Call function under fuzz:
         encoded = payload.hex()
-        try:
-            coverage_blob = self.frida_script.exports.fuzz(encoded)
-            #log.info("sendFuzzPayloadInProcess: len=%d" % len(coverage_blob))
-        except frida.core.RPCException as e:
-            log.info("RPCException: " + repr(e))
-            log.info("CRASH?")
+        coverage_blob = self.targets[0].frida_script.exports.fuzz(encoded)
+        #log.info("sendFuzzPayloadInProcess: len=%d" % len(coverage_blob))
+        # the fuzz call may cause a frida.core.RPCException, e.g. when the function
+        # causes a segfault. we do not catch the exeception here, but in doIteration
+        # where it is registered as a crash
 
-    def getCoverageOfPayload(self, payload, timeout=0.1, retry=5):
+    def waitForCoverage(self, timeout):
+        """
+        Continiously checks the frida script of all targets if their stalker got attached.
+        
+        Returns a tupel:
+          idx 0: the target if the stalker was attached or None if the timeout was hit.
+          idx 1: the stalker_attached boolean  (stalker has been attached in the target process)
+          idx 2: the stalker_finished boolean  (stalker has completed)
+
+        The target (if found) is also set as the active_target
+        """
+        # Create an ordered list of targets to check (last active target is checked first)
+        targets = []
+        if self.active_target != None:
+            targets.append(self.active_target)
+            targets.extend([t for t in self.targets if t != self.active_target])
+        else:
+            targets = self.targets
+
+        # Wait for timeout seconds for any of the stalkers to get attached
+        # (i.e. we hit the target function)
+        start = time.time()
+        while (time.time()-start) < timeout:
+            for target in self.targets:
+                stalker_attached, stalker_finished = target.frida_script.exports.checkstalker()
+                if stalker_attached:
+                    # Found the right target
+                    self.active_target = target
+                    return (target, stalker_attached, stalker_finished)
+        return (None, False, False)
+
+    def getCoverageOfPayload(self, payload, timeout=0.04, retry=0):
         """
         Sends of the payload and checks the returned coverage.
+        If the payload_filter was specified by the user, the payload
+        will first be passed through it.
+        All targets will then be checked for coverage. The function only
+        succeeds if just one target has produced a coverage.
 
         Important:
-            Frida appears to have a bug sometimes in collecting traces with the stalker.. no idea how to fix this yet.. hence we do a retry. This can however screw up the replay functionality and should be fixed in the future.
+            Frida appears to have a bug sometimes in collecting traces with the
+            stalker.. no idea how to fix this yet.. hence we do a retry. This
+            can however screw up the replay functionality and should be fixed
+            in the future.
 
         Arguments:
-            payload {[type]} -- [description]
+            payload {bytes} -- payload which shall be sent to the target
 
         Keyword Arguments:
             timeout {float} -- [description] (default: {0.1})
             retry {int} -- [description] (default: {5})
 
         Returns:
-            [type] -- [description]
+            {set} -- set of basic blocks covered by the payload
         """
+
+        payload = self.runPayloadFilterFunction(payload)
+        if payload == None:
+            return set()
+
+        cov = None
         cnt = 0
         while cnt <= retry:
-            try:
-                if self.project.fuzz_in_process:
-                    self.sendFuzzPayloadInProcess(payload)
-                else:
-                    self.sendFuzzPayload(payload)
+            # Clear coverage info in all targets:
+            for target in self.targets:
+                target.frida_script.exports.clearcoverage()
 
+            # Send payload
+            if self.project.fuzz_in_process:
+                self.sendFuzzPayloadInProcess(payload)
+            else:
+                self.sendFuzzPayload(payload)
+
+            # Wait for timeout seconds for any of the stalkers to get attached
+            target, stalker_attached, stalker_finished = self.waitForCoverage(timeout)
+
+            if target != None:
+                # Found a target that has attached their stalker. Wait for the stalker
+                # to finish and then extract the coverage.
+                # Wait for 1 second <- maybe this should be adjusted / configurable ?
                 start = time.time()
-                cov = None
-                while (cov == None or len(cov) == 0) and (time.time()-start) < timeout:
-                    cov = self.frida_script.exports.getcoverage()
+                while not stalker_finished and (time.time()-start) < 1:
+                    stalker_attached, stalker_finished = target.frida_script.exports.checkstalker()
 
+                if not stalker_finished:
+                    log.info("getCoverageOfPayload: Stalker did not finish after 1 second!")
+                    break
+
+                cov = target.frida_script.exports.getcoverage()
                 if cov != None and len(cov) > 0:
                     break
 
+            else:
+                # None of the targets' function was hit. next try..
                 cnt += 1
 
-                if cov == None or len(cov) == 0:
-                    log.info("getCoverageOfPayload: got nothing!")
-                    return set()
-            except frida.InvalidOperationError as e:
-                log.warning("Error communicating with the frida script: %s" % str(e))
-                self.detach()
-                time.sleep(30)
-                self.attach()
+        if cov == None or len(cov) == 0:
+            log.debug("getCoverageOfPayload: got nothing!")
+            return set()
 
-        return parse_coverage(cov, self.watched_modules)
+        return parse_coverage(cov, self.active_target.watched_modules)
 
 
     def buildCorpus(self):
@@ -232,7 +274,7 @@ class FridaFuzzer:
                 log.update(t + " [iteration=%d] %s" % (i, infile))
 
                 # send packet to target
-                coverage = self.getCoverageOfPayload(fuzz_pkt)
+                coverage = self.getCoverageOfPayload(fuzz_pkt, timeout=1)
                 if coverage == None or len(coverage) == 0:
                     log.warn("No coverage was returned! you might want to delete %s from corpus if it happens more often" % infile)
 
@@ -247,7 +289,7 @@ class FridaFuzzer:
                 # Accumulate coverage:
                 self.accumulated_coverage = self.accumulated_coverage.union(coverage_last)
 
-            write_drcov_file(self.modules, coverage_last,
+            write_drcov_file(self.active_target.modules, coverage_last,
                                      self.project.coverage_dir + "/" + infile.split("/")[-1])
 
         log.finish_update("Using %d input files which cover a total of %d basic blocks!" % (
@@ -264,20 +306,22 @@ class FridaFuzzer:
         start_time = time.time()
         for pkt_file in corpus:
             log.update("[seed=%d] " % seed + time.strftime("%Y-%m-%d %H:%M:%S") + " %s" % pkt_file)
-            #log.info(time.strftime("%Y-%m-%d %H:%M:%S") + " %s" % pkt_file)
-            fuzz_pkt = check_output(["radamsa", "-s", str(seed), pkt_file])
+            fuzz_pkt = self.getMutatedPayload(pkt_file, seed)
+            if fuzz_pkt == None:
+                continue
 
             # Writing History file for replaying
             open(self.project.project_dir + "/frida_fuzzer.history", "a").write(str(pkt_file) + "|" + str(seed) + "\n")
 
             try:
                 coverage = self.getCoverageOfPayload(fuzz_pkt)
-            except (frida.TransportError, frida.InvalidOperationError) as e:
+            except (frida.TransportError, frida.InvalidOperationError, frida.core.RPCException) as e:
                 log.warn("doIteration: Got a frida error: " + str(e))
+                log.debug("Full Stack Trace:\n" + traceback.format_exc())
                 log.info("Current iteration: " + time.strftime("%Y-%m-%d %H:%M:%S") +
                          " [seed=%d] [file=%s]" % (seed, pkt_file))
                 crash_file = self.project.crash_dir + time.strftime("/%Y%m%d_%H%M%S_crash")
-                with open(crash_file + "_" + self.project.pid, "wb") as f:
+                with open(crash_file + "_" + str(self.active_target.process_pid), "wb") as f:
                     f.write(fuzz_pkt)
                 log.info("Payload is written to " + crash_file)
                 self.project.crashes += 1
@@ -294,13 +338,15 @@ class FridaFuzzer:
                 newfile.write(fuzz_pkt)
                 newfile.close()
 
-                cov_file = self.project.coverage_dir + "/" + pkt_file.split("/")[-1]
-                write_drcov_file(self.modules, coverage, cov_file)
-                write_drcov_file(self.modules, coverage.difference(self.accumulated_coverage),
+                cov_file = self.project.coverage_dir + "/" + str(seed) + "_" + pkt_file.split("/")[-1]
+                write_drcov_file(self.active_target.modules, coverage, cov_file)
+                write_drcov_file(self.active_target.modules, coverage.difference(self.accumulated_coverage),
                                          cov_file + "_diff")
 
                 self.project.last_new_path = seed
                 self.accumulated_coverage = self.accumulated_coverage.union(coverage)
+                write_drcov_file(self.active_target.modules, self.accumulated_coverage,
+                                 self.project.coverage_dir + "/accumulated_coverage.drcov")
 
             self.total_executions += 1
 
@@ -323,8 +369,10 @@ class FridaFuzzer:
             for line in fp:
                 pkt_file, seed = line.split("|")
                 try:
-                    fuzz_pkt = check_output(["radamsa", "-s", str(seed.strip()), pkt_file])
-                    if self.project.debug:
+                    fuzz_pkt = self.getMutatedPayload(pkt_file, int(seed.strip()))
+                    if fuzz_pkt == None:
+                        continue
+                    if self.project.debug_mode:
                         open(self.project.debug_dir + "/history", "a").write("file: {} seed: {} \n{}\n".format(
                             pkt_file,
                             seed,
@@ -333,11 +381,12 @@ class FridaFuzzer:
                     coverage = self.getCoverageOfPayload(fuzz_pkt)
                     log.info("Current iteration: " + time.strftime("%Y-%m-%d %H:%M:%S") +
                                 " [seed=%d] [file=%s]" % (int(seed.strip()), pkt_file))
-                except (frida.TransportError, frida.InvalidOperationError) as e:
-                    log.success("doReplay: Got a frida error: " + str(e))
-                    log.success("Current iteration: " + time.strftime("%Y-%m-%d %H:%M:%S") +
+                except (frida.TransportError, frida.InvalidOperationError, frida.core.RPCException) as e:
+                    log.finish_update("doReplay: Got a frida error: " + str(e))
+                    log.debug("Full Stack Trace:\n" + traceback.format_exc())
+                    log.finish_update("Current iteration: " + time.strftime("%Y-%m-%d %H:%M:%S") +
                                 " [seed=%d] [file=%s]" % (int(seed.strip()), pkt_file))
-                    log.success("Server Crashed! Lets narrow it down")
+                    log.finish_update("Server Crashed! Lets narrow it down")
                     #crash_file = self.crash_dir + time.strftime("/%Y%m%d_%H%M%S_crash")
                     #with open(crash_file, "wb") as f:
                     #    f.write(fuzz_pkt)
@@ -346,15 +395,8 @@ class FridaFuzzer:
 
                 if coverage == None:
                     log.warn("No coverage was generated for [%d] %s!" % (seed, pkt_file))
-        log.info("Sending Empty Package to verify the crashing server")
-        try:
-            coverage = self.getCoverageOfPayload(b'FOOBAR')
-        except (frida.TransportError, frida.InvalidOperationError) as e:
-            log.success("Server Crashed! Lets narrow it down")
-            # TODO
-            # Rabbit Mode here
 
-        log.warning("History did not crash the Server! Might be due to some race conditions.")
+        log.warn("Replay did not crash the Server!")
         return False
 
     def doMinimize(self):
@@ -369,54 +411,65 @@ class FridaFuzzer:
         corpus.sort()
 
         if len(corpus) == 0:
-            log.warn("Corpus is empty, please specify an input directory with --indir")
+            log.warn("Corpus is empty, please use the 'add' subcommand to add files to it.")
             return False
 
+        # Collect coverage
+        dict_of_infile_coverages = {}
+        loop_counter = 0
         for infile in corpus:
+            loop_counter += 1
             fuzz_pkt = open(infile, "rb").read()
-            coverage_last = None
-            cov_cnt = 0
+            failed_coverage_count = 0
             tmp_accu_cov = set()
-            for i in range(5):
+            RETRIES = 5
+            for i in range(RETRIES):
                 t = time.strftime("%Y-%m-%d %H:%M:%S")
-                log.update(t + " [iteration=%d] %s" % (i, infile))
+                log.update(t + " Collecting coverage for corpus files (%d/%d) ... [iteration=%d] %s"
+                            % (loop_counter, len(corpus), i, infile))
 
                 # send packet to target
-                coverage = self.getCoverageOfPayload(fuzz_pkt)
+                coverage = self.getCoverageOfPayload(fuzz_pkt, timeout=0.2)
                 if coverage == None or len(coverage) == 0:
-                    cov_cnt += 1
+                    failed_coverage_count += 1
+                    continue
 
-                coverage_last = coverage
                 # Accumulate coverage:
-                tmp_accu_cov = tmp_accu_cov.union(coverage_last)
+                tmp_accu_cov = tmp_accu_cov.union(coverage)
 
-            if cov_cnt >= 4:
-                if os.path.exists(infile):
-                    log.warn("Moving %s from corpus since the returned coverage was always 0" % infile)
-                    #TODO
+            if failed_coverage_count == RETRIES:
+                log.warn("Coverage for %s was always 0 (%d retries)" % (infile, RETRIES))
+                # note: file will be removed later..
+
+            dict_of_infile_coverages[infile] = tmp_accu_cov
+            self.accumulated_coverage = self.accumulated_coverage.union(tmp_accu_cov)
+            write_drcov_file(self.active_target.modules, tmp_accu_cov,
+                                 self.project.coverage_dir + "/" + infile.split("/")[-1])
+
+        log.finish_update("Collected coverage for corpus (%d basic blocks from %d files in corpus)"
+                            % (len(self.accumulated_coverage), len(corpus)))
+
+        # Filter all corpus files with a coverage that is a direct subset of another corpus file
+        loop_counter = 0
+        for infile in corpus:
+            loop_counter += 1
+            log.update("(%d/%d) Comparing %s (%d bblocks) against rest of the corpus..." 
+                        % (loop_counter, len(corpus), infile, len(dict_of_infile_coverages[infile])))
+            for other_infile in [f for f in corpus if f != infile]:
+                if dict_of_infile_coverages[infile].issubset(dict_of_infile_coverages[other_infile]):
+                    log.info("%s coverage is direct subset of %s. Moving to trash..." % (infile, other_infile))
                     backup_file = self.project.corpus_trash_dir + "/" + infile.split("/")[-1]
                     shutil.move(infile, backup_file)
+                    break
 
-
-            if not tmp_accu_cov.issubset(self.accumulated_coverage):
-                # New Paths found. Add it to the overall coverage
-                log.success("File: %s looks good for the corpus! Keeping it" % infile)
-                self.accumulated_coverage = self.accumulated_coverage.union(coverage_last)
-                write_drcov_file(self.modules, coverage_last,
-                                     self.project.coverage_dir + "/" + infile.split("/")[-1])
-            else:
-                # No new paths found with current file... better delete it ;-)
-                if os.path.exists(infile):
-                    log.warn("Deleting %s from corpus since there was no new coverage in it" % infile)
-                    os.remove(infile)
-
-        log.finish_update("Using %d input files which cover a total of %d basic blocks!" % (
-                         len(corpus), len(self.accumulated_coverage)))
-        self.corpus = corpus
+        corpus_new = [self.project.corpus_dir + "/" + x for x in os.listdir(self.project.corpus_dir)]
+        acc_cov_new = set.union(*dict_of_infile_coverages.values())
+        log.finish_update("Remaining input files: %d (total of %d basic blocks)." % (
+                         len(corpus_new), len(acc_cov_new)))
+        self.corpus = corpus_new
         return True
 
     def fuzzerLoop(self):
-        self.getModuleMap()
         try:
             self.start_time = time.time()
             self.total_executions = 0
@@ -432,37 +485,28 @@ class FridaFuzzer:
             log.info("Interrupted by user..")
 
     def attach(self):
-        if self.project.pid != None:
-            target_process = self.project.pid
-        elif self.project.process_name != None:
-            target_process = self.project.process_name
-        else:
-            log.warn("No process specified with 'process_name' or 'pid'!")
-            return False
+        """
+        Attach frida to all specified targets (project.targets)
+        """
+        scriptfile = os.path.join(os.path.dirname(__file__),'frida_script.js')
+        log.info("Loading script: %s" % scriptfile)
+        script_code = open(scriptfile, "r").read()
 
-        if self.project.remote_frida:
-            self.frida_session = frida.get_remote_device().attach(target_process)
-        else:
-            self.frida_session = frida.attach(target_process)
-        self.loadScript()
-        pid = self.frida_script.exports.getpid()
-        log.info("Attached to pid %d!" % pid)
-        self.project.pid = pid
-
-        # Query the loaded modules from the target
-        self.getModuleMap()
-
-        # ... and create the module filter list
-        self.createModuleFilterList()
+        for target in self.targets:
+            if not target.attach(script_code):
+                return False
+            if target.getModuleMap() == None:            # Query the loaded modules from the target
+                return False
+            if not target.createModuleFilterList():      # ... and create the module filter list
+                return False
         return True
 
     def detach(self):
-        try:
-            self.frida_script.unload()
-        except frida.InvalidOperationError as e:
-            log.warn("Could not unload frida script: " + str(e))
-
-        self.frida_session.detach()
+        """
+        Detach frida from all targets.
+        """
+        for target in self.targets:
+            target.detach()
 
 
 ###
@@ -516,11 +560,6 @@ def replay(args, fuzzer):
 
 
 def minimize(args, fuzzer):
-    # Create Fuzzer and attach to target
-    fuzzer = FridaFuzzer(project.getInstance())
-    if not fuzzer.attach():
-        return
-
     if fuzzer.doMinimize():
         log.info("Minimized the Corpus. Start again without the minimizing option!")
     else:
@@ -569,6 +608,9 @@ def parse_args():
     # Parse arguments
     args = parser.parse_args()
 
+    if args.command == None:
+        parser.print_help()
+        sys.exit(-1)
     if args.verbose:
         log.log_level = 3
     if args.project == None:
@@ -583,14 +625,23 @@ def main():
 
     if args.command != "init":
         # Load project
-        if not project.loadProject(args.project):
+        if not project.loadProject(args.project, args):
             log.warn("Error: Could not load project '%s'!" % args.project)
             return
+
+        if project.getInstance().logfile_name != None:
+            log.logfile = open(project.getInstance().logfile_name, "wb", 0)
+
+        if not project.getInstance().colored_output:
+            log.use_color = False
+            log.CLEAR_LINE = ""      # no escape sequences for the no-color option!
 
     if args.command in ["fuzz", "replay", "minimize"]:
         # Create Fuzzer and attach to target
         fuzzer = FridaFuzzer(project.getInstance())
         if not fuzzer.attach():
+            return
+        if not fuzzer.loadPayloadFilter():
             return
 
         # Invoke subcommand function with instantiated fuzzer
@@ -604,6 +655,8 @@ def main():
         args.func(args)
 
     log.info("Done")
+    if log.logfile != None:
+        log.logfile.close()
     return
 
 

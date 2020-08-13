@@ -16,32 +16,52 @@ BROWN        ='\033[33m'
 YELLOW       ='\033[33m'
 GRAY         ='\033[30m'
 
+CLEAR_LINE   ='\033[K'
+
 update_ongoing = False
+logfile        = None
+use_color      = True
 
 # debug = 3   info = 2   warn = 1
 log_level = 2 
 
 def add_color(msg, color):
-    return color + msg + COLOR_NC
+    if use_color:
+        return color + msg + COLOR_NC
+    else:
+        return msg
 
-def writeLine(msg):
-    global update_ongoing
-    if update_ongoing:
-        sys.stdout.write("\n")
-    sys.stdout.write(msg + "\n")
-    update_ongoing = False
+def writeLine(msg, do_update_line=False):
+    global update_ongoing, logfile
+    if not do_update_line:
+        # if we are not called from update() and are currently in update_ongoing
+        # then stop update_ongoing by going to the next line:
+        if update_ongoing:
+            sys.stdout.write("\n")
+            update_ongoing = False
+        sys.stdout.write(msg + "\n")
+    else:
+        sys.stdout.write(msg)
+
+    if logfile != None:
+        msg = msg + "\n"
+        for i in ["\r",COLOR_NC,WHITE,BLACK,BLUE,GREEN,CYAN,RED,PURPLE,BROWN,YELLOW,GRAY,CLEAR_LINE]:
+            msg = msg.replace(i,"")
+        logfile.write(msg.encode("ascii"))
 
 def update(msg):
     global update_ongoing, log_level
     if log_level >= 2:
         update_ongoing = True
-        sys.stdout.write("\r[" + add_color("*",YELLOW) + "] " + msg)
+        clear_line_seq = CLEAR_LINE if use_color else ""
+        msg = "\r"+clear_line_seq+"[" + add_color("*",YELLOW) + "] " + msg
+        writeLine(msg, do_update_line=True)
 
 def finish_update(msg):
     global update_ongoing, log_level
     if log_level >= 2:
         update_ongoing = False
-        writeLine("\r[" + add_color("*",GREEN) + "] " + msg)
+        writeLine("\r"+CLEAR_LINE+"[" + add_color("*",GREEN) + "] " + msg)
 
 def debug(msg):
     global log_level

@@ -3,6 +3,7 @@
 # Frida-based fuzzer for blackbox fuzzing of network services.
 #
 # Author: Dennis Mantz (ERNW GmbH)
+#         Birk Kauer   (ERNW GmbH)
 
 import struct
 
